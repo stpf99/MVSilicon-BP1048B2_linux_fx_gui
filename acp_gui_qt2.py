@@ -9,7 +9,7 @@ Wymagania:
 """
 
 import os, sys, struct, time, json, copy, re as _re, queue as _queue
-import subprocess
+import subprocess, threading
 try:
     import usb.core as _usb_core, usb.util as _usb_util
     _HAS_PYUSB = True
@@ -268,45 +268,164 @@ def acp_query_device(query="fw") -> dict:
 def dsp_send_raw(pkt: bytes) -> str:
     """
     Wysyła PEŁNĄ ramkę ACP do DSP przez IFACE=4, control transfer.
-    pkt: pełna ramka (np. A5 5A 82 0B FF 01 00 ... 16), padowana do 64 bajtów.
+    WAŻNE: dotykamy TYLKO iface 4 — audio na iface 0-3 pozostaje nienaruszone!
     """
     if _HAS_PYUSB:
         try:
             dev = _usb_core.find(idVendor=0x8888, idProduct=0x1719)
             if dev is not None:
-                for i in range(6):
-                    try:
-                        if dev.is_kernel_driver_active(i):
-                            dev.detach_kernel_driver(i)
-                    except Exception:
-                        pass
+                # Tylko iface 4 — nie ruszamy audio (iface 0-3)!
+                try:
+                    if dev.is_kernel_driver_active(4):
+                        dev.detach_kernel_driver(4)
+                except Exception:
+                    pass
                 _usb_util.claim_interface(dev, 4)
-                # NAPRAWA: wysyłamy pełną ramkę (do 64 bajtów), nie tylko 3 bajty!
                 pkt64 = bytes(pkt[:64]).ljust(64, b'\x00')
                 dev.ctrl_transfer(0x21, 0x09, 0x0200, 0x0004, pkt64)
                 _usb_util.release_interface(dev, 4)
-                for i in range(6):
-                    try: dev.attach_kernel_driver(i)
-                    except: pass
+                try: dev.attach_kernel_driver(4)
+                except: pass
                 return "OK"
         except Exception as e:
             return f"pyusb ERR: {e}"
     return "pyusb niedostępne"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AcpLink — trwałe połączenie (iface 4 only, audio nienaruszone)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AcpLink:
+    """
+    Trwałe połączenie USB do BP1048B2 przez interface 4 (HID/ACP).
+    Claim tylko iface 4 — audio (iface 0-3) zostaje nieruszone przez cały czas.
+    Thread-safe dzięki locku.
+    Obsługuje wysyłanie PEŁNYCH ramek ACP oraz polling odczytu (0x83).
+    """
+    def __init__(self):
+        self._dev = None
+        self._lock = threading.Lock()
+        self._open = False
+
+    def open(self) -> bool:
+        if not _HAS_PYUSB:
+            return False
+        with self._lock:
+            try:
+                dev = _usb_core.find(idVendor=0x8888, idProduct=0x1719)
+                if dev is None:
+                    return False
+                # Tylko iface 4 — audio iface 0-3 pozostają przy kernelu!
+                try:
+                    if dev.is_kernel_driver_active(4):
+                        dev.detach_kernel_driver(4)
+                except Exception:
+                    pass
+                _usb_util.claim_interface(dev, 4)
+                self._dev = dev
+                self._open = True
+                return True
+            except Exception as e:
+                print(f"[AcpLink] open error: {e}")
+                return False
+
+    def close(self):
+        with self._lock:
+            if self._dev:
+                try: _usb_util.release_interface(self._dev, 4)
+                except: pass
+                try: self._dev.attach_kernel_driver(4)
+                except: pass
+                self._dev = None
+            self._open = False
+
+    def send(self, frame: bytes) -> str:
+        """Wysyła pełną ramkę ACP. Nie otwiera/zamyka — używa trwałego połączenia."""
+        with self._lock:
+            if not self._dev:
+                return "NOT_CONNECTED"
+            try:
+                pkt = bytes(frame[:64]).ljust(64, b'\x00')
+                self._dev.ctrl_transfer(0x21, 0x09, 0x0200, 4, pkt)
+                return "OK"
+            except Exception as e:
+                self._open = False
+                return f"ERR: {e}"
+
+    def query(self, mid: int, timeout_ms: int = 400) -> bytes:
+        """
+        Polling odczytu aktualnych wartości modułu mid.
+        Wysyła ramkę z len=1 (tylko 0xFF, bez params) → firmware zwraca stan.
+        Odpowiedź czyta z endpoint 0x83 (HID interrupt IN).
+        Zwraca surowe bajty odpowiedzi lub b"" przy błędzie.
+        """
+        # Query frame: A5 5A [mid] 01 FF 16  (len=1, tylko param_select, brak params → polling)
+        q_frame = SYNC_HEAD + bytes([mid, 1, ALL_PARAM, SYNC_TAIL])
+        with self._lock:
+            if not self._dev:
+                return b""
+            try:
+                pkt = bytes(q_frame).ljust(64, b'\x00')
+                self._dev.ctrl_transfer(0x21, 0x09, 0x0200, 4, pkt)
+                time.sleep(0.04)
+                resp = bytes(self._dev.read(0x83, 64, timeout=timeout_ms))
+                return resp
+            except Exception:
+                return b""
+
+    @property
+    def is_open(self) -> bool:
+        return self._open and self._dev is not None
+
+
+# Globalna instancja — otwierana przy połączeniu, zamykana przy wyjściu
+_acp_link = AcpLink()
+
+
+def parse_acp_response(data: bytes):
+    """
+    Parsuje odpowiedź ACP: A5 5A [mid] [len] FF [p0_lo p0_hi] ... [16]
+    Zwraca (module_id, [int16 values]) lub (None, []) przy błędzie.
+    """
+    if len(data) < 5 or data[0] != 0xA5 or data[1] != 0x5A:
+        return (None, [])
+    mid = data[2]
+    ln = data[3]
+    if len(data) < 4 + ln:
+        return (mid, [])
+    payload = data[4:4 + ln]
+    if not payload or payload[0] != ALL_PARAM:
+        return (mid, [])
+    raw = payload[1:]  # pomiń 0xFF
+    vals = []
+    for i in range(0, len(raw) - 1, 2):
+        v = raw[i] | (raw[i + 1] << 8)
+        if v >= 0x8000:
+            v -= 0x10000
+        vals.append(v)
+    return (mid, vals)
+
+
 def acp_send_frame(frame: bytes) -> str:
     """
     Wysyła pełną ramkę ACP do DSP.
-    Metoda 1: pyusb IFACE=4 — pełna ramka (NAPRAWIONE)
-    Metoda 2: fallback → subprocess acp_send (raw hex)
+    Priorytet: trwałe połączenie AcpLink → pyusb jednorazowe → subprocess.
+    Trwałe połączenie NIE przerywa audio (nie dotyka iface 0-3).
     """
-    # Metoda 1: pyusb iface 4 — PEŁNA ramka
+    # Metoda 1: trwałe połączenie (preferowane — brak dropout audio)
+    if _acp_link.is_open:
+        r = _acp_link.send(frame)
+        if r == "OK":
+            return "OK"
+
+    # Metoda 2: pyusb jednorazowe (tylko iface 4)
     if _HAS_PYUSB:
         r = dsp_send_raw(frame)
         if r == "OK":
             return "OK"
 
-    # Metoda 2: subprocess acp_send (raw hex — już obsługuje >3 bajtów)
+    # Metoda 3: subprocess acp_send
     hex_str = " ".join(f"{b:02X}" for b in frame)
     try:
         r = subprocess.run(
@@ -511,6 +630,68 @@ GAIN_MODULES = {
     "gain_spdif":      (MODULE["SPDIF_IN_GAIN"],   "SPDIF In Gain"),
 }
 
+# Odwrotne mapowanie: klucz widgetu → nazwa modułu (dla instant send)
+KEY_TO_MODULE: dict[str, str] = {}
+for _mod_name, (_mod_id, _keys) in {**MIC_MODULES, **MUS_MODULES}.items():
+    for _k in _keys:
+        KEY_TO_MODULE[_k] = _mod_name
+for _gkey in GAIN_MODULES:
+    KEY_TO_MODULE[_gkey] = f"__gain__{_gkey}"
+
+# Mapowanie module_id → (mod_name, keys) — do parsowania odpowiedzi urządzenia
+_MID_TO_MODULE: dict[int, tuple] = {}
+for _n, (_id, _ks) in {**MIC_MODULES, **MUS_MODULES}.items():
+    _MID_TO_MODULE[_id] = (_n, _ks)
+
+
+class ReadAllWorker(QThread):
+    """
+    Odczytuje aktualne wartości WSZYSTKICH modułów efektów z urządzenia.
+    Wysyła frame z len=1 (polling mode) i czyta odpowiedź z 0x83.
+    Emituje module_read(module_id, values_list) dla każdego modułu.
+    """
+    module_read = pyqtSignal(int, list)   # (mid, [int16 values])
+    progress    = pyqtSignal(int, int)    # (done, total)
+    log         = pyqtSignal(str, str)
+    done        = pyqtSignal()
+
+    def run(self):
+        if not _acp_link.is_open:
+            self.log.emit("⚠ Brak trwałego połączenia — odczyt niemożliwy", "warn")
+            self.done.emit()
+            return
+
+        all_mods = list(MIC_MODULES.items()) + list(MUS_MODULES.items())
+        gain_list = list(GAIN_MODULES.items())
+        total = len(all_mods) + len(gain_list)
+        done_count = 0
+
+        self.log.emit(f"📥 Odczyt {total} modułów z urządzenia…", "info")
+
+        for mod_name, (mod_id, keys) in all_mods:
+            resp = _acp_link.query(mod_id, timeout_ms=350)
+            mid, vals = parse_acp_response(resp)
+            if mid == mod_id and vals:
+                self.module_read.emit(mod_id, vals)
+                self.log.emit(f"  ← 0x{mod_id:02X} {mod_name}: {vals[:6]}{'…' if len(vals)>6 else ''}", "rx")
+            else:
+                self.log.emit(f"  ⚠ 0x{mod_id:02X} {mod_name}: brak odpowiedzi", "warn")
+            done_count += 1
+            self.progress.emit(done_count, total)
+            time.sleep(0.06)
+
+        for gain_key, (mod_id, label) in gain_list:
+            resp = _acp_link.query(mod_id, timeout_ms=350)
+            mid, vals = parse_acp_response(resp)
+            if mid == mod_id and vals:
+                self.module_read.emit(mod_id, vals)
+            done_count += 1
+            self.progress.emit(done_count, total)
+            time.sleep(0.06)
+
+        self.log.emit("✓ Odczyt zakończony — suwaki zaktualizowane.", "ok")
+        self.done.emit()
+
 
 def _widget_val(self, key):
     """Pobiera wartość z widgetu (SliderRow → int, QCheckBox → 0/1)."""
@@ -611,6 +792,11 @@ class ConnectWorker(QThread):
             self.failed.emit(msg)
             return
         ensure_acp_query()
+        # Otwórz trwałe połączenie (tylko iface 4 — audio nienaruszone)
+        if _acp_link.open():
+            print("[AcpLink] ✓ Trwałe połączenie iface 4 — audio bezpieczne")
+        else:
+            print("[AcpLink] ⚠ Fallback na subprocess (pyusb niedostępne)")
         self.connected.emit()
 
 
@@ -813,6 +999,10 @@ class FxMixerTab(QWidget):
         self._presets = load_presets()
         self._w = {}        # key → SliderRow | QCheckBox
         self._active_preset = None
+        self._live_send = True          # instant send włączony domyślnie
+        self._debounce_timers = {}      # mod_name → QTimer (debounce instant send)
+        self._read_worker = None
+        self._suppress_instant = False  # True podczas ładowania presetu
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
@@ -831,6 +1021,9 @@ class FxMixerTab(QWidget):
         self._fx_root.setContentsMargins(14,10,14,14); self._fx_root.setSpacing(6)
         self._build_fx()
         outer.addWidget(scroll, 1)
+
+        # Podłącz instant send po zbudowaniu wszystkich widgetów
+        self._wire_instant_send()
 
     # ── Helpers: dodawanie widgetów do layoutu + rejestracja w self._w ──
 
@@ -854,6 +1047,65 @@ class FxMixerTab(QWidget):
         elif isinstance(w, QCheckBox):
             return int(w.isChecked())
         return 0
+
+    # ── Instant send (debounced per-module) ──
+
+    def _wire_instant_send(self):
+        """
+        Podłącz każdy widget do debouncowanego wysyłania modułu.
+        Każda zmiana wartości uruchamia (lub restartuje) 300 ms timer dla
+        danego modułu DSP; po jego upływie wysyłany jest tylko ten jeden moduł.
+        """
+        for key, widget in self._w.items():
+            mod_name = KEY_TO_MODULE.get(key)
+            if mod_name is None:
+                continue
+            # Upewnij się, że timer dla tego modułu istnieje
+            if mod_name not in self._debounce_timers:
+                t = QTimer(self)
+                t.setSingleShot(True)
+                t.setInterval(300)
+                # Domknięcie po wartości mod_name w chwili tworzenia timera
+                t.timeout.connect(lambda mn=mod_name: self._instant_send_module(mn))
+                self._debounce_timers[mod_name] = t
+
+            timer = self._debounce_timers[mod_name]
+
+            if isinstance(widget, SliderRow):
+                widget.valueChanged.connect(
+                    lambda _v, t=timer: self._on_widget_changed(t))
+            elif isinstance(widget, QCheckBox):
+                widget.stateChanged.connect(
+                    lambda _s, t=timer: self._on_widget_changed(t))
+
+    def _on_widget_changed(self, timer: QTimer):
+        """Restartuje debounce timer jeśli instant send jest aktywny."""
+        if self._live_send and not self._suppress_instant:
+            timer.start()
+
+    def _instant_send_module(self, mod_name: str):
+        """Wysyła pojedynczy moduł do DSP (wywoływane przez debounce timer)."""
+        if not self._live_send or self._suppress_instant:
+            return
+        if mod_name.startswith("__gain__"):
+            gkey = mod_name[len("__gain__"):]
+            if gkey not in GAIN_MODULES:
+                return
+            mod_id, label = GAIN_MODULES[gkey]
+            pregain = self._val(gkey)
+            params = u16([1, pregain, 0, 2])
+            frame = build_frame(mod_id, params)
+            self.send_frames.emit([(frame, label)])
+        elif mod_name in MIC_MODULES:
+            mod_id, keys = MIC_MODULES[mod_name]
+            vals = [self._val(k) for k in keys]
+            frame = build_frame(mod_id, u16(vals))
+            self.send_frames.emit([(frame, mod_name)])
+        elif mod_name in MUS_MODULES:
+            mod_id, keys = MUS_MODULES[mod_name]
+            vals = [self._val(k) for k in keys]
+            frame = build_frame(mod_id, u16(vals))
+            self.send_frames.emit([(frame, mod_name)])
 
     # ── Preset panel ──
 

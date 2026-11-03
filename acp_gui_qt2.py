@@ -21,10 +21,10 @@ from PyQt5.QtWidgets import (
     QTextEdit, QFileDialog, QProgressBar, QTabWidget, QGroupBox,
     QCheckBox, QSlider, QFrame, QScrollArea,
     QTreeWidget, QTreeWidgetItem, QSizePolicy,
-    QMessageBox, QStatusBar, QInputDialog, QSplitter
+    QMessageBox, QStatusBar, QInputDialog, QSplitter, QDoubleSpinBox, QSpinBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QColor, QPalette, QTextCursor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF
+from PyQt5.QtGui import QFont, QColor, QPalette, QTextCursor, QPainter, QPen, QBrush, QPolygonF
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Protokół ACP
@@ -184,16 +184,27 @@ ACP_QUERY_BIN = os.path.join(_SCRIPT_DIR, "acp_query")
 ACP_QUERY_SRC = os.path.join(_SCRIPT_DIR, "acp_query.c")
 
 def ensure_acp_send():
+    """Kompiluje acp_send jeśli trzeba i ZAWSZE ustawia bit wykonywania."""
+    def _chmod_ok():
+        try:
+            os.chmod(ACP_SEND_BIN, 0o755)
+            return True
+        except Exception:
+            return False
+
+    if os.path.isfile(ACP_SEND_BIN) and (
+        not os.path.isfile(ACP_SEND_SRC) or
+        os.path.getmtime(ACP_SEND_SRC) <= os.path.getmtime(ACP_SEND_BIN)
+    ):
+        _chmod_ok()
+        return True, f"Binarka gotowa: {ACP_SEND_BIN}"
+
     if not os.path.isfile(ACP_SEND_SRC):
         if os.path.isfile(ACP_SEND_BIN):
+            _chmod_ok()
             return True, f"Binarka gotowa: {ACP_SEND_BIN}"
         return False, f"Brak {ACP_SEND_SRC} i brak binarki"
-    need_build = (
-        not os.path.isfile(ACP_SEND_BIN) or
-        os.path.getmtime(ACP_SEND_SRC) > os.path.getmtime(ACP_SEND_BIN)
-    )
-    if not need_build:
-        return True, f"Binarka aktualna: {ACP_SEND_BIN}"
+
     print(f"[BUILD] Kompiluję {ACP_SEND_SRC} …")
     try:
         r = subprocess.run(
@@ -201,33 +212,82 @@ def ensure_acp_send():
             capture_output=True, text=True, timeout=15
         )
         if r.returncode == 0:
-            os.chmod(ACP_SEND_BIN, 0o755)
+            _chmod_ok()
             return True, f"✓ Skompilowano: {ACP_SEND_BIN}"
-        else:
-            return False, f"Błąd kompilacji:\n{r.stderr.strip()}"
+        return False, f"Błąd kompilacji:\n{r.stderr.strip()}"
     except FileNotFoundError:
         return False, "Brak gcc — zainstaluj: sudo apt install build-essential libusb-1.0-0-dev"
     except Exception as e:
         return False, f"Błąd kompilacji: {e}"
 
 def ensure_acp_query():
+    """Kompiluje acp_query jeśli trzeba i ZAWSZE ustawia bit wykonywania."""
+    def _chmod_ok():
+        try:
+            if os.path.isfile(ACP_QUERY_BIN):
+                os.chmod(ACP_QUERY_BIN, 0o755)
+            return True
+        except Exception:
+            return False
+
     if os.path.isfile(ACP_QUERY_BIN):
+        _chmod_ok()
         return True, ACP_QUERY_BIN
     if not os.path.isfile(ACP_QUERY_SRC):
-        return False, f"Brak {ACP_QUERY_SRC}"
+        return False, f"Brak {ACP_QUERY_SRC} — skopiuj acp_query.c do katalogu programu"
     try:
         r = subprocess.run(
             ["gcc", "-O2", "-o", ACP_QUERY_BIN, ACP_QUERY_SRC, "-lusb-1.0"],
             capture_output=True, text=True, timeout=15
         )
         if r.returncode == 0:
-            os.chmod(ACP_QUERY_BIN, 0o755)
+            _chmod_ok()
             return True, ACP_QUERY_BIN
         return False, r.stderr.strip()
     except Exception as e:
         return False, str(e)
 
+def _parse_query_raw(raw_bytes: bytes) -> dict:
+    """Parsuje surowe bajty odpowiedzi ACP (A5 5A …) na dict fw/cpu."""
+    if len(raw_bytes) < 5 or raw_bytes[0] != 0xA5 or raw_bytes[1] != 0x5A:
+        return {"error": f"zła odpowiedź: {raw_bytes[:16].hex(' ')}"}
+    raw = list(raw_bytes)
+    module_id = raw[2]
+    # payload po [A5 5A mid len] — len jest raw[3], potem FF + data
+    ln = raw[3] if len(raw) > 3 else 0
+    payload = raw[4:4 + ln] if ln else raw[4:]
+    if payload and payload[0] == ALL_PARAM:
+        data = payload[1:]
+    else:
+        data = payload
+    result = {"module_id": module_id, "raw": raw}
+    if module_id == 0x00 and len(data) >= 5:
+        result["fw_type"] = data[0]
+        result["fw_ver"]  = f"V{data[1]}.{data[2]}.{data[3] if len(data)>3 else 0}"
+        result["fx_ver"]  = f"V{data[4]}.{data[5]}.{data[6] if len(data)>6 else 0}" if len(data)>5 else "?"
+        chip_map = {0x30:"BPxx", 0x20:"AP82xx", 0x10:"DU56x", 0x40:"DU26x"}
+        result["chip"] = chip_map.get(data[0], f"0x{data[0]:02X}")
+    elif module_id == 0x01 and len(data) >= 4:
+        def le16(i): return data[i] | (data[i+1] << 8) if i+1 < len(data) else 0
+        result["cpu_used"]  = le16(0)
+        result["cpu_total"] = le16(2)
+        result["mem_used"]  = le16(4)
+        result["mem_total"] = le16(6)
+    return result
+
+
 def acp_query_device(query="fw") -> dict:
+    """
+    Odczyt FW / CPU.
+    Preferuje otwarte AcpLink (pyusb) — bez subprocess i bez konfliktu o USB.
+    Fallback: binarka acp_query.
+    """
+    mid = 0x00 if query == "fw" else 0x01 if query == "cpu" else None
+    if mid is not None and _acp_link.is_open:
+        resp = _acp_link.query(mid, timeout_ms=400)
+        if resp:
+            return _parse_query_raw(resp)
+
     ok, msg = ensure_acp_query()
     if not ok:
         return {"error": msg}
@@ -238,25 +298,8 @@ def acp_query_device(query="fw") -> dict:
         )
         if r.returncode != 0 or not r.stdout.strip():
             return {"error": r.stderr.strip() or "brak odpowiedzi"}
-        raw = [int(x, 16) for x in r.stdout.strip().split(",") if x.strip()]
-        if len(raw) < 5 or raw[0] != 0xA5 or raw[1] != 0x5A:
-            return {"error": f"zła odpowiedź: {r.stdout.strip()[:40]}"}
-        module_id = raw[2]
-        data = raw[4:]
-        result = {"module_id": module_id, "raw": raw}
-        if module_id == 0x00 and len(data) >= 5:
-            result["fw_type"] = data[0]
-            result["fw_ver"]  = f"V{data[1]}.{data[2]}.{data[3] if len(data)>3 else 0}"
-            result["fx_ver"]  = f"V{data[4]}.{data[5]}.{data[6] if len(data)>6 else 0}" if len(data)>5 else "?"
-            chip_map = {0x30:"BPxx", 0x20:"AP82xx", 0x10:"DU56x", 0x40:"DU26x"}
-            result["chip"] = chip_map.get(data[0], f"0x{data[0]:02X}")
-        elif module_id == 0x01 and len(data) >= 4:
-            def le16(i): return data[i] | (data[i+1] << 8) if i+1 < len(data) else 0
-            result["cpu_used"]  = le16(0)
-            result["cpu_total"] = le16(2)
-            result["mem_used"]  = le16(4)
-            result["mem_total"] = le16(6)
-        return result
+        raw = bytes(int(x, 16) for x in r.stdout.strip().split(",") if x.strip())
+        return _parse_query_raw(raw)
     except Exception as e:
         return {"error": str(e)}
 
@@ -426,6 +469,7 @@ def acp_send_frame(frame: bytes) -> str:
             return "OK"
 
     # Metoda 3: subprocess acp_send
+    ensure_acp_send()  # upewnij się o +x
     hex_str = " ".join(f"{b:02X}" for b in frame)
     try:
         r = subprocess.run(
@@ -438,6 +482,8 @@ def acp_send_frame(frame: bytes) -> str:
         return "TIMEOUT"
     except FileNotFoundError:
         return f"BRAK: {ACP_SEND_BIN}"
+    except PermissionError:
+        return f"ERR: brak prawa wykonywania {ACP_SEND_BIN} — uruchom: chmod +x {ACP_SEND_BIN}"
     except Exception as e:
         return f"ERR: {e}"
 
@@ -994,8 +1040,10 @@ class FxMixerTab(QWidget):
     send_single = pyqtSignal(bytes, str)
     log         = pyqtSignal(str, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, mode="all", parent=None):
+        """mode: 'mic' | 'music' | 'all' — które sekcje FX budować."""
         super().__init__(parent)
+        self._mode = mode
         self._presets = load_presets()
         self._w = {}        # key → SliderRow | QCheckBox
         self._active_preset = None
@@ -1190,7 +1238,22 @@ class FxMixerTab(QWidget):
 
     def _build_fx(self):
         r = self._fx_root
+        mode = getattr(self, "_mode", "all")
+        show_mic = mode in ("mic", "all")
+        show_mus = mode in ("music", "all")
+        # Gain: na zakładce music (wejścia/music out) i mic (kanały mic)
+        show_gain_mic = mode in ("mic", "all")
+        show_gain_mus = mode in ("music", "all")
 
+        if show_mic:
+            self._build_fx_mic(r)
+        if show_mus:
+            self._build_fx_music(r)
+        if show_gain_mic or show_gain_mus:
+            self._build_fx_gain(r, show_gain_mic=show_gain_mic, show_gain_mus=show_gain_mus)
+
+
+    def _build_fx_mic(self, r):
         # ══════════════════════════════════════════════════════════════════
         # 🎙 MIKROFON
         # ══════════════════════════════════════════════════════════════════
@@ -1289,6 +1352,8 @@ class FxMixerTab(QWidget):
         row.addWidget(b); row.addStretch(); r.addLayout(row)
         r.addWidget(hsep())
 
+
+    def _build_fx_music(self, r):
         # ══════════════════════════════════════════════════════════════════
         # 🎵 MUZYKA
         # ══════════════════════════════════════════════════════════════════
@@ -1375,52 +1440,38 @@ class FxMixerTab(QWidget):
         row.addWidget(b); row.addStretch(); r.addLayout(row)
         r.addWidget(hsep())
 
-        # ══════════════════════════════════════════════════════════════════
-        # 🔊 WZMACNIANIE (Gain)
-        # ══════════════════════════════════════════════════════════════════
+
+    def _build_fx_gain(self, r, show_gain_mic=True, show_gain_mus=True):
         r.addWidget(section_lbl("🔊  WZMACNIANIE (Gain)"))
         gg = QGridLayout(); gg.setSpacing(6)
 
-        g = QGroupBox("Mic — kanały"); l = QVBoxLayout(g); l.setSpacing(3)
-        self._sl(l, "gain_mic", "Mic Out", 0, 8192, 4096)
-        self._sl(l, "gain_mic_bypass", "Mic Bypass", 0, 8192, 4096)
-        self._sl(l, "gain_mic_echo", "Mic Echo", 0, 8192, 4096)
-        self._sl(l, "gain_mic_rev", "Mic Reverb", 0, 8192, 4096)
-        gg.addWidget(g, 0, 0)
+        if show_gain_mic:
+            g = QGroupBox("Mic — kanały"); l = QVBoxLayout(g); l.setSpacing(3)
+            self._sl(l, "gain_mic", "Mic Out", 0, 8192, 4096)
+            self._sl(l, "gain_mic_bypass", "Mic Bypass", 0, 8192, 4096)
+            self._sl(l, "gain_mic_echo", "Mic Echo", 0, 8192, 4096)
+            self._sl(l, "gain_mic_rev", "Mic Reverb", 0, 8192, 4096)
+            gg.addWidget(g, 0, 0)
 
-        g = QGroupBox("Wejścia"); l = QVBoxLayout(g); l.setSpacing(3)
-        self._sl(l, "gain_bt", "Bluetooth", 0, 8192, 4096)
-        self._sl(l, "gain_usb", "USB Card", 0, 8192, 4096)
-        self._sl(l, "gain_i2s", "I2S", 0, 8192, 4096)
-        self._sl(l, "gain_spdif", "SPDIF", 0, 8192, 4096)
-        gg.addWidget(g, 0, 1)
+        if show_gain_mus:
+            g = QGroupBox("Wejścia"); l = QVBoxLayout(g); l.setSpacing(3)
+            self._sl(l, "gain_bt", "Bluetooth", 0, 8192, 4096)
+            self._sl(l, "gain_usb", "USB Card", 0, 8192, 4096)
+            self._sl(l, "gain_i2s", "I2S", 0, 8192, 4096)
+            self._sl(l, "gain_spdif", "SPDIF", 0, 8192, 4096)
+            gg.addWidget(g, 0, 1 if show_gain_mic else 0)
 
-        g = QGroupBox("Wyjście muzyki"); l = QVBoxLayout(g); l.setSpacing(3)
-        self._sl(l, "gain_mus", "Music Out", 0, 8192, 4096)
-        gg.addWidget(g, 1, 0)
+            g = QGroupBox("Wyjście muzyki"); l = QVBoxLayout(g); l.setSpacing(3)
+            self._sl(l, "gain_mus", "Music Out", 0, 8192, 4096)
+            gg.addWidget(g, 1, 0)
 
         r.addLayout(gg)
         row = QHBoxLayout()
         b = accent_btn("▶  Zastosuj GAIN")
-        b.setToolTip("Wyślij wszystkie wartości wzmocnienia do DSP")
+        b.setToolTip("Wyślij wzmocnienia do DSP")
         b.clicked.connect(self._apply_gains)
         row.addWidget(b); row.addStretch(); r.addLayout(row)
 
-        r.addStretch()
-
-    # ── Wysyłanie modułów do DSP ──
-
-    def _make_frames(self, modules_map):
-        """
-        Z mapowania (prefix → (mod_id, [keys])) buduje listę (label, frame_bytes).
-        """
-        frames = []
-        for prefix, (mod_id, keys) in modules_map.items():
-            vals = [self._val(k) for k in keys]
-            params = u16(vals)
-            frame = build_frame(mod_id, params)
-            frames.append((prefix, frame))
-        return frames
 
     def _apply_mic(self):
         frames = self._make_frames(MIC_MODULES)
@@ -1447,10 +1498,13 @@ class FxMixerTab(QWidget):
         self.send_frames.emit([(f, lbl) for lbl, f in frames])
 
     def _apply_all(self):
-        """Wyślij wszystko: MIC + MUSIC + GAIN."""
-        self.log.emit("══ Zastosuj WSZYSTKO ══", "info")
-        self._apply_mic()
-        self._apply_music()
+        """Wyślij sekcje widoczne na tej zakładce."""
+        mode = getattr(self, "_mode", "all")
+        self.log.emit("══ Zastosuj ══", "info")
+        if mode in ("mic", "all"):
+            self._apply_mic()
+        if mode in ("music", "all"):
+            self._apply_music()
         self._apply_gains()
         self.log.emit("══ Zakończono ══", "ok")
 
@@ -1603,6 +1657,629 @@ class SnifferTab(QWidget):
         self._count_lbl.setText("Pakietów: 0")
 
 
+
+
+# ── Presety EQ (Music Pre / Out) ────────────────────────────────────────────
+EQ_PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "acp_eq_presets.json")
+
+# Każdy preset: {"pregain_db": float, "enable": 0/1, "bands": [ {en,type,f0,Q,gain_db} × 10 ]}
+DEFAULT_EQ_PRESETS = {
+    "Flat (HP+LP)": {
+        "enable": 1, "pregain_db": 0.0,
+        "bands": (
+            [{"en": 1, "type": 4, "f0": 50, "Q": 0.71, "gain_db": 0.0},
+             {"en": 1, "type": 3, "f0": 16000, "Q": 0.71, "gain_db": 0.0}]
+            + [{"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0}] * 8
+        ),
+    },
+    "Bass Boost": {
+        "enable": 1, "pregain_db": -1.5,
+        "bands": [
+            {"en": 1, "type": 1, "f0": 80, "Q": 0.70, "gain_db": 5.0},   # low shelf
+            {"en": 1, "type": 0, "f0": 200, "Q": 1.00, "gain_db": 2.0},
+            {"en": 1, "type": 0, "f0": 1000, "Q": 0.90, "gain_db": 0.0},
+            {"en": 1, "type": 0, "f0": 4000, "Q": 0.90, "gain_db": -1.0},
+            {"en": 1, "type": 3, "f0": 16000, "Q": 0.71, "gain_db": 0.0},
+        ] + [{"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0}] * 5,
+    },
+    "Voice Clarity": {
+        "enable": 1, "pregain_db": 0.0,
+        "bands": [
+            {"en": 1, "type": 4, "f0": 80, "Q": 0.71, "gain_db": 0.0},
+            {"en": 1, "type": 0, "f0": 250, "Q": 1.20, "gain_db": -2.0},
+            {"en": 1, "type": 0, "f0": 1800, "Q": 1.00, "gain_db": 3.0},
+            {"en": 1, "type": 0, "f0": 3500, "Q": 1.20, "gain_db": 2.5},
+            {"en": 1, "type": 0, "f0": 8000, "Q": 0.90, "gain_db": 1.0},
+            {"en": 1, "type": 3, "f0": 14000, "Q": 0.71, "gain_db": 0.0},
+        ] + [{"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0}] * 4,
+    },
+    "V-Shape": {
+        "enable": 1, "pregain_db": -1.0,
+        "bands": [
+            {"en": 1, "type": 1, "f0": 60, "Q": 0.70, "gain_db": 4.0},
+            {"en": 1, "type": 0, "f0": 400, "Q": 0.80, "gain_db": -2.5},
+            {"en": 1, "type": 0, "f0": 1000, "Q": 0.80, "gain_db": -3.0},
+            {"en": 1, "type": 0, "f0": 4000, "Q": 0.90, "gain_db": 1.5},
+            {"en": 1, "type": 2, "f0": 8000, "Q": 0.70, "gain_db": 3.5},
+        ] + [{"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0}] * 5,
+    },
+    "Loudness": {
+        "enable": 1, "pregain_db": 0.0,
+        "bands": [
+            {"en": 1, "type": 1, "f0": 100, "Q": 0.70, "gain_db": 3.0},
+            {"en": 1, "type": 0, "f0": 1000, "Q": 0.70, "gain_db": 0.0},
+            {"en": 1, "type": 2, "f0": 8000, "Q": 0.70, "gain_db": 2.5},
+        ] + [{"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0}] * 7,
+    },
+    "Sub Cut": {
+        "enable": 1, "pregain_db": 0.0,
+        "bands": [
+            {"en": 1, "type": 4, "f0": 120, "Q": 0.71, "gain_db": 0.0},
+            {"en": 1, "type": 3, "f0": 16000, "Q": 0.71, "gain_db": 0.0},
+        ] + [{"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0}] * 8,
+    },
+}
+
+
+def load_eq_presets():
+    presets = {k: json.loads(json.dumps(v)) for k, v in DEFAULT_EQ_PRESETS.items()}  # deep copy
+    if os.path.isfile(EQ_PRESETS_PATH):
+        try:
+            with open(EQ_PRESETS_PATH, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            presets.update(user)
+        except Exception as e:
+            print(f"[EQ] Błąd odczytu presetów: {e}")
+    return presets
+
+
+def save_eq_presets(presets):
+    # zapisuj tylko user-defined (nie nadpisuj built-in w pliku — zapisujemy wszystkie poza defaultami opcjonalnie)
+    user = {k: v for k, v in presets.items() if k not in DEFAULT_EQ_PRESETS}
+    try:
+        with open(EQ_PRESETS_PATH, "w", encoding="utf-8") as f:
+            json.dump(user, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[EQ] Błąd zapisu presetów: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parametric EQ — 10-band editor (Music Pre EQ 0xA2 / Music Out EQ 0xA3)
+# Format parametrów (kolejność jak w ZK_DAM_DEFAULT.ini / ACP Workbench):
+#   enable, pregain, calculation_type,
+#   [filter_en, type, f0, Q, gain] × 10
+# Q przechowywane jako int(Q * 1024)  → 0.707 ≈ 724
+# Gain w 0.01 dB  →  +3.0 dB = 300
+# ─────────────────────────────────────────────────────────────────────────────
+
+FILTER_TYPES = [
+    (0, "Peak"),
+    (1, "Low Shelf"),
+    (2, "High Shelf"),
+    (3, "Low Pass"),
+    (4, "High Pass"),
+    (5, "Band Pass"),
+    (6, "Notch"),
+]
+
+EQ_BANKS = {
+    "Music Pre EQ":  MODULE["MUSIC_PRE_EQ"],   # 0xA2
+    "Music Out EQ":  MODULE["MUSIC_OUT_EQ"],   # 0xA3
+}
+
+def _q_to_ui(q_raw: int) -> float:
+    return max(0.1, q_raw / 1024.0)
+
+def _q_from_ui(q: float) -> int:
+    return max(1, int(round(q * 1024)))
+
+def _gain_to_ui(g_raw: int) -> float:
+    return g_raw / 100.0
+
+def _gain_from_ui(g: float) -> int:
+    return int(round(g * 100))
+
+
+class EqCurveWidget(QWidget):
+    """Prosty podgląd magnitude response (dB vs log-f) dla 10 filtrów biquad."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(180)
+        self.setMinimumWidth(320)
+        self._filters = []   # list of dicts: en, type, f0, Q, gain_db
+        self._pregain_db = 0.0
+        self.setStyleSheet("background:#080c14; border:1px solid #1a2030; border-radius:4px;")
+
+    def set_filters(self, filters, pregain_db=0.0):
+        self._filters = filters
+        self._pregain_db = pregain_db
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        margin_l, margin_r, margin_t, margin_b = 42, 12, 12, 28
+        plot_w = max(10, w - margin_l - margin_r)
+        plot_h = max(10, h - margin_t - margin_b)
+
+        # tło
+        p.fillRect(self.rect(), QColor("#080c14"))
+
+        # siatka
+        p.setPen(QPen(QColor("#1a2030"), 1))
+        # poziome (dB)
+        for db in range(-24, 25, 6):
+            y = margin_t + plot_h * (1.0 - (db + 24) / 48.0)
+            p.drawLine(int(margin_l), int(y), int(margin_l + plot_w), int(y))
+        # pionowe (dekady częstotliwości)
+        import math
+        freqs = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
+        for f in freqs:
+            x = margin_l + plot_w * (math.log10(f) - math.log10(20)) / (math.log10(20000) - math.log10(20))
+            p.drawLine(int(x), margin_t, int(x), margin_t + plot_h)
+
+        # osie podpisów
+        p.setPen(QColor("#5a6a88"))
+        font = p.font(); font.setPointSize(8); p.setFont(font)
+        for db in (-24, -12, 0, 12, 24):
+            y = margin_t + plot_h * (1.0 - (db + 24) / 48.0)
+            p.drawText(2, int(y + 4), f"{db:+d}")
+        for f, label in [(20,"20"), (100,"100"), (1000,"1k"), (10000,"10k"), (20000,"20k")]:
+            x = margin_l + plot_w * (math.log10(f) - math.log10(20)) / (math.log10(20000) - math.log10(20))
+            p.drawText(int(x - 10), h - 8, label)
+
+        # linia 0 dB
+        p.setPen(QPen(QColor("#2a3a50"), 1, Qt.DashLine))
+        y0 = margin_t + plot_h * (1.0 - (0 + 24) / 48.0)
+        p.drawLine(int(margin_l), int(y0), int(margin_l + plot_w), int(y0))
+
+        # krzywa
+        if not self._filters:
+            p.end()
+            return
+
+        n_pts = max(64, plot_w)
+        xs, ys = [], []
+        for i in range(n_pts):
+            t = i / (n_pts - 1)
+            f = 10 ** (math.log10(20) + t * (math.log10(20000) - math.log10(20)))
+            mag_db = self._pregain_db
+            for flt in self._filters:
+                if not flt.get("en"):
+                    continue
+                mag_db += self._biquad_mag_db(f, flt)
+            # clamp do widoku
+            mag_db = max(-24.0, min(24.0, mag_db))
+            x = margin_l + plot_w * t
+            y = margin_t + plot_h * (1.0 - (mag_db + 24) / 48.0)
+            xs.append(x); ys.append(y)
+
+        pen = QPen(QColor("#00d4aa"), 2)
+        p.setPen(pen)
+        for i in range(1, len(xs)):
+            p.drawLine(QPointF(xs[i-1], ys[i-1]), QPointF(xs[i], ys[i]))
+        p.end()
+
+    @staticmethod
+    def _biquad_mag_db(f, flt):
+        """Przybliżona magnitude [dB] biquad (RBJ cookbook) przy częstotliwości f."""
+        import math
+        fs = 48000.0
+        f0 = max(1.0, float(flt.get("f0", 1000)))
+        Q  = max(0.05, float(flt.get("Q", 0.707)))
+        gain_db = float(flt.get("gain_db", 0.0))
+        ftype = int(flt.get("type", 0))
+        A = 10 ** (gain_db / 40.0)
+        w0 = 2 * math.pi * f0 / fs
+        cosw = math.cos(w0)
+        sinw = math.sin(w0)
+        alpha = sinw / (2 * Q)
+        # współczynniki (znormalizowane a0=1)
+        if ftype == 0:  # Peak
+            b0 = 1 + alpha * A
+            b1 = -2 * cosw
+            b2 = 1 - alpha * A
+            a0 = 1 + alpha / A
+            a1 = -2 * cosw
+            a2 = 1 - alpha / A
+        elif ftype == 1:  # Low Shelf
+            sa = 2 * math.sqrt(A) * alpha
+            b0 = A * ((A + 1) - (A - 1) * cosw + sa)
+            b1 = 2 * A * ((A - 1) - (A + 1) * cosw)
+            b2 = A * ((A + 1) - (A - 1) * cosw - sa)
+            a0 = (A + 1) + (A - 1) * cosw + sa
+            a1 = -2 * ((A - 1) + (A + 1) * cosw)
+            a2 = (A + 1) + (A - 1) * cosw - sa
+        elif ftype == 2:  # High Shelf
+            sa = 2 * math.sqrt(A) * alpha
+            b0 = A * ((A + 1) + (A - 1) * cosw + sa)
+            b1 = -2 * A * ((A - 1) + (A + 1) * cosw)
+            b2 = A * ((A + 1) + (A - 1) * cosw - sa)
+            a0 = (A + 1) - (A - 1) * cosw + sa
+            a1 = 2 * ((A - 1) - (A + 1) * cosw)
+            a2 = (A + 1) - (A - 1) * cosw - sa
+        elif ftype == 3:  # Low Pass
+            b0 = (1 - cosw) / 2
+            b1 = 1 - cosw
+            b2 = (1 - cosw) / 2
+            a0 = 1 + alpha
+            a1 = -2 * cosw
+            a2 = 1 - alpha
+        elif ftype == 4:  # High Pass
+            b0 = (1 + cosw) / 2
+            b1 = -(1 + cosw)
+            b2 = (1 + cosw) / 2
+            a0 = 1 + alpha
+            a1 = -2 * cosw
+            a2 = 1 - alpha
+        elif ftype == 5:  # Band Pass (constant 0 dB peak)
+            b0 = alpha
+            b1 = 0
+            b2 = -alpha
+            a0 = 1 + alpha
+            a1 = -2 * cosw
+            a2 = 1 - alpha
+        elif ftype == 6:  # Notch
+            b0 = 1
+            b1 = -2 * cosw
+            b2 = 1
+            a0 = 1 + alpha
+            a1 = -2 * cosw
+            a2 = 1 - alpha
+        else:
+            return 0.0
+        # normalizacja
+        b0 /= a0; b1 /= a0; b2 /= a0; a1 /= a0; a2 /= a0
+        # |H(e^{jw})|
+        w = 2 * math.pi * f / fs
+        zr = math.cos(w); zi = math.sin(w)
+        # z^{-1} = cos - j sin, z^{-2} = cos2 - j sin2
+        z2r = math.cos(2*w); z2i = math.sin(2*w)
+        num_r = b0 + b1 * zr + b2 * z2r
+        num_i =     - b1 * zi - b2 * z2i
+        den_r = 1  + a1 * zr + a2 * z2r
+        den_i =     - a1 * zi - a2 * z2i
+        mag2 = (num_r**2 + num_i**2) / max(1e-20, den_r**2 + den_i**2)
+        return 10 * math.log10(max(1e-20, mag2))
+
+
+class EqBandRow(QWidget):
+    changed = pyqtSignal()
+
+    def __init__(self, idx: int, parent=None):
+        super().__init__(parent)
+        self.idx = idx
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(6)
+
+        self.en = QCheckBox(f"F{idx+1}")
+        self.en.setFixedWidth(42)
+        self.en.setChecked(False)
+        lay.addWidget(self.en)
+
+        self.type = QComboBox()
+        for tid, tname in FILTER_TYPES:
+            self.type.addItem(tname, tid)
+        self.type.setFixedWidth(100)
+        lay.addWidget(self.type)
+
+        self.f0 = QSpinBox()
+        self.f0.setRange(20, 20000)
+        self.f0.setValue(1000)
+        self.f0.setSuffix(" Hz")
+        self.f0.setFixedWidth(90)
+        lay.addWidget(self.f0)
+
+        self.Q = QDoubleSpinBox()
+        self.Q.setRange(0.1, 16.0)
+        self.Q.setSingleStep(0.05)
+        self.Q.setDecimals(2)
+        self.Q.setValue(0.71)
+        self.Q.setFixedWidth(70)
+        lay.addWidget(self.Q)
+
+        self.gain = QDoubleSpinBox()
+        self.gain.setRange(-12.0, 12.0)
+        self.gain.setSingleStep(0.5)
+        self.gain.setDecimals(1)
+        self.gain.setValue(0.0)
+        self.gain.setSuffix(" dB")
+        self.gain.setFixedWidth(80)
+        lay.addWidget(self.gain)
+
+        for w in (self.en, self.type, self.f0, self.Q, self.gain):
+            if isinstance(w, QCheckBox):
+                w.stateChanged.connect(self.changed)
+            else:
+                w.valueChanged.connect(self.changed) if hasattr(w, "valueChanged") else w.currentIndexChanged.connect(self.changed)
+
+    def get(self) -> dict:
+        return {
+            "en": int(self.en.isChecked()),
+            "type": int(self.type.currentData()),
+            "f0": int(self.f0.value()),
+            "Q": float(self.Q.value()),
+            "gain_db": float(self.gain.value()),
+        }
+
+    def set(self, d: dict):
+        self.en.setChecked(bool(d.get("en", 0)))
+        tid = int(d.get("type", 0))
+        idx = self.type.findData(tid)
+        if idx >= 0:
+            self.type.setCurrentIndex(idx)
+        self.f0.setValue(int(d.get("f0", 1000)))
+        self.Q.setValue(float(d.get("Q", 0.71)))
+        self.gain.setValue(float(d.get("gain_db", 0.0)))
+
+
+class EqEditorTab(QWidget):
+    """10-pasmowy parametryczny EQ dla Music Pre / Music Out."""
+    send_frames = pyqtSignal(list)   # list[(bytes, label)]
+    log = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._live = True
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(280)
+        self._debounce.timeout.connect(self._send_current)
+        self._suppress = False
+
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        self._presets = load_eq_presets()
+        self._active_preset = None
+
+        # pasek górny: bank + enable + pregain + live
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Bank:"))
+        self._bank = QComboBox()
+        for name in EQ_BANKS:
+            self._bank.addItem(name)
+        self._bank.currentIndexChanged.connect(self._on_bank_changed)
+        top.addWidget(self._bank)
+
+        self._eq_en = QCheckBox("EQ Enable")
+        self._eq_en.setChecked(True)
+        self._eq_en.stateChanged.connect(self._on_any_change)
+        top.addWidget(self._eq_en)
+
+        top.addWidget(QLabel("Pregain:"))
+        self._pregain = QDoubleSpinBox()
+        self._pregain.setRange(-12.0, 12.0)
+        self._pregain.setSingleStep(0.5)
+        self._pregain.setDecimals(1)
+        self._pregain.setValue(0.0)
+        self._pregain.setSuffix(" dB")
+        self._pregain.valueChanged.connect(self._on_any_change)
+        top.addWidget(self._pregain)
+
+        self._live_ck = QCheckBox("Live")
+        self._live_ck.setChecked(True)
+        self._live_ck.setToolTip("Wysyłaj zmiany automatycznie (debounce ~280 ms)")
+        self._live_ck.stateChanged.connect(lambda s: setattr(self, "_live", bool(s)))
+        top.addWidget(self._live_ck)
+
+        top.addStretch()
+        apply_btn = accent_btn("▶  Zastosuj EQ")
+        apply_btn.clicked.connect(self._send_current)
+        top.addWidget(apply_btn)
+        reset_btn = QPushButton("Reset pasm")
+        reset_btn.clicked.connect(self._reset_bands)
+        top.addWidget(reset_btn)
+        root.addLayout(top)
+
+        # pasek presetów EQ
+        pre = QHBoxLayout()
+        pre.addWidget(QLabel("Preset:"))
+        self._preset_cmb = QComboBox()
+        self._preset_cmb.setMinimumWidth(160)
+        self._rebuild_preset_combo()
+        self._preset_cmb.currentIndexChanged.connect(self._on_preset_selected)
+        pre.addWidget(self._preset_cmb)
+        load_btn = QPushButton("Załaduj")
+        load_btn.setToolTip("Załaduj wybrany preset do edytora (bez wysyłania)")
+        load_btn.clicked.connect(self._load_selected_preset)
+        pre.addWidget(load_btn)
+        save_btn = QPushButton("💾 Zapisz jako…")
+        save_btn.clicked.connect(self._save_preset)
+        pre.addWidget(save_btn)
+        del_btn = danger_btn("🗑")
+        del_btn.setToolTip("Usuń preset użytkownika")
+        del_btn.clicked.connect(self._delete_preset)
+        pre.addWidget(del_btn)
+        cal_btn = QPushButton("🎛 Z kalibracji…")
+        cal_btn.setToolTip("Placeholder: w przyszłości import krzywej z autokalibracji Line In/Out")
+        cal_btn.clicked.connect(lambda: QMessageBox.information(
+            self, "Kalibracja",
+            "Autokalibracja (Line Out → mic/Line In → EQ) będzie dostępna w kolejnej wersji.\n"
+            "Na razie zapisz ręcznie ustawione pasma jako własny preset."))
+        pre.addWidget(cal_btn)
+        pre.addStretch()
+        root.addLayout(pre)
+
+        # krzywa
+        self._curve = EqCurveWidget()
+        root.addWidget(self._curve)
+
+        # nagłówek kolumn
+        hdr = QHBoxLayout()
+        for text, w in [("En", 42), ("Typ", 100), ("f0", 90), ("Q", 70), ("Gain", 80)]:
+            lab = QLabel(text); lab.setObjectName("dim"); lab.setFixedWidth(w)
+            hdr.addWidget(lab)
+        hdr.addStretch()
+        root.addLayout(hdr)
+
+        # 10 pasm
+        bands_w = QWidget()
+        bands_lay = QVBoxLayout(bands_w)
+        bands_lay.setContentsMargins(0, 0, 0, 0)
+        bands_lay.setSpacing(2)
+        self._bands: list[EqBandRow] = []
+        for i in range(10):
+            row = EqBandRow(i)
+            row.changed.connect(self._on_any_change)
+            bands_lay.addWidget(row)
+            self._bands.append(row)
+        bands_lay.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(bands_w)
+        scroll.setMinimumHeight(260)
+        root.addWidget(scroll, 1)
+
+        # domyślne wartości jak w ZK_DAM_DEFAULT (HP + LP)
+        self._load_default_for_bank()
+
+    def _current_mod_id(self) -> int:
+        return EQ_BANKS[self._bank.currentText()]
+
+    def _on_bank_changed(self, _i):
+        self._suppress = True
+        self._load_default_for_bank()
+        self._suppress = False
+        self._update_curve()
+
+    def _load_default_for_bank(self):
+        """Ustawia sensowny default: HP 50 Hz + LP 16 kHz (jak w DAM)."""
+        self._eq_en.setChecked(True)
+        self._pregain.setValue(0.0)
+        for i, row in enumerate(self._bands):
+            if i == 0:
+                row.set({"en": 1, "type": 4, "f0": 50, "Q": 0.71, "gain_db": 0.0})
+            elif i == 1:
+                row.set({"en": 1, "type": 3, "f0": 16000, "Q": 0.71, "gain_db": 0.0})
+            else:
+                row.set({"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0})
+        self._update_curve()
+
+    def _reset_bands(self):
+        self._suppress = True
+        self._load_default_for_bank()
+        self._suppress = False
+        if self._live:
+            self._send_current()
+
+    def _on_any_change(self, *_):
+        if self._suppress:
+            return
+        self._update_curve()
+        if self._live:
+            self._debounce.start()
+
+    def _update_curve(self):
+        flts = []
+        for row in self._bands:
+            d = row.get()
+            flts.append({
+                "en": d["en"],
+                "type": d["type"],
+                "f0": d["f0"],
+                "Q": d["Q"],
+                "gain_db": d["gain_db"],
+            })
+        self._curve.set_filters(flts, pregain_db=self._pregain.value())
+
+    def _pack_params(self) -> list:
+        """Lista int zgodna z kolejnością INI / ACP."""
+        vals = [
+            1 if self._eq_en.isChecked() else 0,
+            _gain_from_ui(self._pregain.value()),
+            2,  # calculation_type
+        ]
+        for row in self._bands:
+            d = row.get()
+            vals.extend([
+                d["en"],
+                d["type"],
+                d["f0"],
+                _q_from_ui(d["Q"]),
+                _gain_from_ui(d["gain_db"]),
+            ])
+        return vals
+
+
+    def _rebuild_preset_combo(self):
+        self._preset_cmb.blockSignals(True)
+        self._preset_cmb.clear()
+        for name in self._presets:
+            tag = "" if name in DEFAULT_EQ_PRESETS else " ★"
+            self._preset_cmb.addItem(name + tag, name)
+        self._preset_cmb.blockSignals(False)
+
+    def _on_preset_selected(self, _i):
+        pass  # wybór bez auto-load — przycisk Załaduj
+
+    def _load_selected_preset(self):
+        name = self._preset_cmb.currentData()
+        if not name or name not in self._presets:
+            return
+        p = self._presets[name]
+        self._suppress = True
+        self._eq_en.setChecked(bool(p.get("enable", 1)))
+        self._pregain.setValue(float(p.get("pregain_db", 0.0)))
+        bands = p.get("bands", [])
+        for i, row in enumerate(self._bands):
+            if i < len(bands):
+                row.set(bands[i])
+            else:
+                row.set({"en": 0, "type": 0, "f0": 1000, "Q": 0.71, "gain_db": 0.0})
+        self._suppress = False
+        self._active_preset = name
+        self._update_curve()
+        self.log.emit(f"📂 Załadowano preset EQ: {name}", "ok")
+
+    def _save_preset(self):
+        text, ok = QInputDialog.getText(self, "Zapisz preset EQ", "Nazwa presetu:")
+        if not ok or not text.strip():
+            return
+        name = text.strip()
+        if name in DEFAULT_EQ_PRESETS:
+            QMessageBox.warning(self, "Chroniony", "Nie można nadpisać wbudowanego presetu. Wybierz inną nazwę.")
+            return
+        bands = [row.get() for row in self._bands]
+        self._presets[name] = {
+            "enable": 1 if self._eq_en.isChecked() else 0,
+            "pregain_db": float(self._pregain.value()),
+            "bands": bands,
+        }
+        save_eq_presets(self._presets)
+        self._rebuild_preset_combo()
+        # select new
+        idx = self._preset_cmb.findData(name)
+        if idx >= 0:
+            self._preset_cmb.setCurrentIndex(idx)
+        self._active_preset = name
+        self.log.emit(f"✓ Zapisano preset EQ: {name}", "ok")
+
+    def _delete_preset(self):
+        name = self._preset_cmb.currentData()
+        if not name:
+            return
+        if name in DEFAULT_EQ_PRESETS:
+            QMessageBox.warning(self, "Chroniony", "Nie można usunąć wbudowanego presetu.")
+            return
+        self._presets.pop(name, None)
+        save_eq_presets(self._presets)
+        self._rebuild_preset_combo()
+        self._active_preset = None
+        self.log.emit(f"🗑 Usunięto preset EQ: {name}", "ok")
+
+    def _send_current(self):
+        mod_id = self._current_mod_id()
+        vals = self._pack_params()
+        frame = build_frame(mod_id, u16(vals))
+        label = f"EQ 0x{mod_id:02X} ({self._bank.currentText()})"
+        self.log.emit(f"→ {label}: {len(vals)} paramów", "info")
+        self.send_frames.emit([(frame, label)])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Device Info Tab
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1644,8 +2321,35 @@ class DeviceInfoTab(QWidget):
         dl.addWidget(refresh)
         lay.addWidget(dg)
 
+        btn_row = QHBoxLayout()
+        rf = accent_btn("🔄 Odśwież FW / CPU")
+        rf.clicked.connect(self._manual_refresh)
+        btn_row.addWidget(rf)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        self._hint = QLabel("Po połączeniu z DSP dane FW/CPU odświeżają się automatycznie.")
+        self._hint.setObjectName("dim")
+        self._hint.setWordWrap(True)
+        lay.addWidget(self._hint)
+
         lay.addStretch()
         self._worker = None
+
+    def _manual_refresh(self):
+        fw = acp_query_device("fw")
+        if "error" in fw:
+            self.log.emit(f"FW query: {fw['error']}", "warn")
+            self._hint.setText(f"Błąd FW: {fw['error']}")
+        else:
+            self._on_fw(fw)
+            self._hint.setText("FW OK")
+            self.log.emit(f"FW: {fw.get('chip','?')} {fw.get('fw_ver','?')} FX {fw.get('fx_ver','?')}", "ok")
+        cpu = acp_query_device("cpu")
+        if "error" not in cpu:
+            self._on_cpu(cpu)
+        else:
+            self.log.emit(f"CPU query: {cpu['error']}", "warn")
 
     def start_monitoring(self):
         self._refresh_devs()
@@ -1660,14 +2364,29 @@ class DeviceInfoTab(QWidget):
             self._worker.stop(); self._worker.wait(2000); self._worker = None
 
     def _on_fw(self, info):
+        if "error" in info:
+            for lbl in self._fw_labels.values():
+                lbl.setText("—")
+            return
+        mapping = {
+            "chip": info.get("chip") or info.get("fw_type") or "—",
+            "fw_ver": info.get("fw_ver") or "—",
+            "fx_ver": info.get("fx_ver") or "—",
+        }
         for key, lbl in self._fw_labels.items():
-            lbl.setText(str(info.get(key, "—")))
+            lbl.setText(str(mapping.get(key, info.get(key, "—"))))
 
     def _on_cpu(self, info):
-        cu = info.get("cpu_used", 0); ct = info.get("cpu_total", 1)
-        mu = info.get("mem_used", 0); mt = info.get("mem_total", 1)
-        self._cpu_bar.setRange(0, ct); self._cpu_bar.setValue(cu)
-        self._mem_bar.setRange(0, mt); self._mem_bar.setValue(mu)
+        if "error" in info:
+            return
+        cu = int(info.get("cpu_used", 0) or 0)
+        ct = max(1, int(info.get("cpu_total", 1) or 1))
+        mu = int(info.get("mem_used", 0) or 0)
+        mt = max(1, int(info.get("mem_total", 1) or 1))
+        self._cpu_bar.setRange(0, ct); self._cpu_bar.setValue(min(cu, ct))
+        self._mem_bar.setRange(0, mt); self._mem_bar.setValue(min(mu, mt))
+        self._cpu_bar.setFormat(f"CPU: {cu}/{ct}")
+        self._mem_bar.setFormat(f"MEM: {mu}/{mt}")
 
     def _refresh_devs(self):
         devs = scan_hid_devices()
@@ -1707,22 +2426,18 @@ class AcpMainWindow(QMainWindow):
         splitter.addWidget(self._log)
         self.setCentralWidget(splitter)
 
-        # ── Zakładki ──
-        self._fx_tab = FxMixerTab()
+        # ── Zakładki (bez Sniffer — zbędny na Linuxie produkcyjnie) ──
+        self._mic_tab = FxMixerTab(mode="mic")
+        self._mus_tab = FxMixerTab(mode="music")
+        self._eq_tab = EqEditorTab()
         self._ini_tab = IniUploadTab()
-        self._sniff_tab = SnifferTab()
         self._info_tab = DeviceInfoTab()
 
-        self._tabs.addTab(self._fx_tab, "🎛  FX Mixer")
+        self._tabs.addTab(self._mic_tab, "🎙  Mic FX")
+        self._tabs.addTab(self._mus_tab, "🎵  Music FX")
+        self._tabs.addTab(self._eq_tab, "🎚  EQ 10-band")
         self._tabs.addTab(self._ini_tab, "📄  INI Upload")
-        self._tabs.addTab(self._sniff_tab, "📡  USB Sniffer")
         self._tabs.addTab(self._info_tab, "ℹ️  Device Info")
-
-        # ── Połączenie sygnałów log ──
-        self._fx_tab.log.connect(self._log.append_colored)
-        self._ini_tab.log.connect(self._log.append_colored)
-        self._sniff_tab.log.connect(self._log.append_colored)
-        self._info_tab.log.connect(self._log.append_colored)
 
         # ── QueuedSendWorker — stały wątek wysyłania ──
         self._send_worker = QueuedSendWorker()
@@ -1730,8 +2445,12 @@ class AcpMainWindow(QMainWindow):
         self._send_worker.frame_error.connect(self._on_frame_error)
         self._send_worker.start()
 
-        # Połącz send_frames z kolejką
-        self._fx_tab.send_frames.connect(self._enqueue_frames)
+        # Połącz send_frames + log z zakładkami
+        for _tab in (self._mic_tab, self._mus_tab, self._eq_tab):
+            _tab.send_frames.connect(self._enqueue_frames)
+            _tab.log.connect(self._log.append_colored)
+        self._ini_tab.log.connect(self._log.append_colored)
+        self._info_tab.log.connect(self._log.append_colored)
 
         # ── ConnectWorker ──
         self._conn_worker = None
